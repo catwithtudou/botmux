@@ -147,7 +147,6 @@ import { describeSendFailure, dispatchPrimaryMessage, findStdinAliasAttachment, 
 import { buildCardPatchSuccessOutput, CARD_COMMAND_USAGE, CARD_PATCH_USAGE, cardPatchArgsWantHelp, executeCardPatch, parseCardPatchArgs, readCardPatchInput } from './cli/card-dispatch.js';
 import { dispatchDeferredTopicSend, reusableDeferredTopicRoot, type DeferredScheduleRunData } from './cli/deferred-topic-send.js';
 import { readDeferredTopicBinding } from './core/deferred-topic-binding.js';
-import { resolveDaemonEnv } from './cli/daemon-lifecycle-env.js';
 import { callDashboard, type DashboardEndpoint, type DashboardResult } from './cli/dashboard-endpoint.js';
 import { ensureDevboxDashboardExport } from './platform/devbox-dashboard-export.js';
 import { platformMachineBaseUrl, publicReverseProxyBaseUrl } from './platform/binding.js';
@@ -162,7 +161,11 @@ import {
   formatDashboardUnreachable,
   shouldKeepWaitingForDashboard,
 } from './cli/dashboard-command.js';
-import { globalInstallUpdateLockTarget, globalInstallUpdateLockTargetIn, installLatestBotmuxSync } from './core/maintenance.js';
+import {
+  globalInstallUpdateLockTarget,
+  installLatestBotmuxSync,
+  prepareRestartDriverContext,
+} from './core/maintenance.js';
 import {
   formatGlobalInstallCommand,
   resolveGlobalInstallPlan,
@@ -242,7 +245,6 @@ import {
   stripTrailingOaiMemoryCitation,
 } from './services/bridge-fallback-gate.js';
 import {
-  bindRestartLeaseTo,
   commitRestartIntentAttemptTo,
   consumeRestartIntentTo,
   removeRestartIntentAttemptTo,
@@ -2599,18 +2601,7 @@ interface RestartLifecycleFlags {
 
 
 async function cmdRestart(): Promise<void> {
-  const restartLeaseId = process.env.BOTMUX_RESTART_LEASE_ID;
-  const restartLeaseDir = process.env.BOTMUX_RESTART_LEASE_DIR;
-  delete process.env.BOTMUX_RESTART_LEASE_ID;
-  delete process.env.BOTMUX_RESTART_LEASE_DIR;
-  if (restartLeaseId) {
-    if (!restartLeaseDir) throw new Error('restart driver lease directory is missing');
-    let bound = false;
-    withFileLockSync(globalInstallUpdateLockTargetIn(restartLeaseDir), () => {
-      bound = bindRestartLeaseTo(restartLeaseDir, restartLeaseId, process.pid, Date.now());
-    });
-    if (!bound) throw new Error('failed to bind restart driver lease');
-  }
+  const { refreshPersistedEnv, readFailureFallback } = prepareRestartDriverContext();
   if (!hasConfig()) {
     console.error('❌ 未找到配置文件');
     console.error('   请先运行: botmux setup');
@@ -2652,7 +2643,7 @@ async function cmdRestart(): Promise<void> {
       const { restartFleet, fleetMemberNames, waitFleetOnline } = await import('./core/fleet-runtime.js');
       let health: ReturnType<typeof waitFleetOnline>;
       try {
-        const r = restartFleet();
+        const r = restartFleet({ refreshPersistedEnv, readFailureFallback });
         if (r.stop.action === 'timeout') {
           throw new Error(
             `[restart] 旧 supervisor (pid ${r.stop.supervisorPid}) 未在超时时间内退出；已 SIGKILL 后仍存活，中止重启。`,
