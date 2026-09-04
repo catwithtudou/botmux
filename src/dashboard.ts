@@ -2937,9 +2937,6 @@ async function buildGroupsMatrix(): Promise<GroupsMatrix> {
           oncallChat: null,
           hasRole: false,
           hasMessageListener: false,
-          pinStreamingCardMasterEnabled: false,
-          pinStreamingCardChatEnabled: true,
-          pinStreamingCardEffectiveEnabled: false,
         });
       }
     }
