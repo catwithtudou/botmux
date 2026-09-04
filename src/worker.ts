@@ -400,7 +400,8 @@ import {
   installHook,
   type HookInstallConfig,
 } from './adapters/hook-installer.js';
-import { hookCommandFor } from './adapters/hook-command.js';
+import { hookCommandFor, nativeSubagentRuntimeHookCommand } from './adapters/hook-command.js';
+import { traexNativeSubagentHookConfig } from './adapters/cli/traex.js';
 import { findOnlineDaemon, parseDaemonIpcPort } from './utils/daemon-discovery.js';
 import { fetchDaemonIpc } from './core/daemon-ipc-auth.js';
 import { withCodexAppContext } from './utils/codex-app-context.js';
@@ -1262,6 +1263,9 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
       cliBin, cwd: cfg.workingDir, env: engineEnv, sessionId: cfg.sessionId,
       model: cfg.model, modelBackendVariant: cfg.modelBackendVariant, reasoningEffort: cfg.reasoningEffort, log: (m: string) => log(m),
       appServerFeatures: cfg.cliId === 'traex' ? ['default_mode_request_user_input'] : undefined,
+      appServerConfig: cfg.cliId === 'traex'
+        ? [traexNativeSubagentHookConfig(nativeSubagentRuntimeHookCommand())]
+        : undefined,
       onRequestUserInput: cfg.cliId === 'traex'
         ? (params: unknown) => bridgeTraexUserInput(cfg, params)
         : undefined,
@@ -1537,6 +1541,7 @@ let sandboxStopWatcher: (() => void) | null = null;  // stop fn for the sandbox 
 let sandboxCleanup: (() => void) | null = null;      // reclaim deny-mask mountpoints + rm the per-session sandbox tree
 let sandboxRelayOutbox: string | null = null;
 let sandboxRelayCapability: { token: string; turnId?: string; dispatchAttempt?: number } | null = null;
+let sandboxPolicyCapability: string | null = null;
 let readIsolationOriginCapabilityFile: string | null = null;
 let readIsolationOriginChannelId: string | null = null;
 let sandboxTeardownDone = false;                     // guards the exit-time best-effort teardown from double-running / running on suspend-for-resume
@@ -2852,6 +2857,7 @@ function currentGatewayTrustedTurnIdentity() {
 
 function publishSandboxRelayCapability(opts: { failClosed?: boolean } = {}): boolean {
   const daemonIpcPort = parseDaemonIpcPort(process.env.BOTMUX_DAEMON_IPC_PORT);
+  const policyCapability = sandboxPolicyCapability ?? randomBytes(32).toString('hex');
   const capability = {
     token: randomBytes(32).toString('hex'),
     ...(currentBotmuxTurnId ? { turnId: currentBotmuxTurnId } : {}),
@@ -2863,7 +2869,19 @@ function publishSandboxRelayCapability(opts: { failClosed?: boolean } = {}): boo
     ...(sandboxRelayOutbox
       ? [{
           path: join(sandboxRelayOutbox, RELAY_ORIGIN_CAPABILITY_BASENAME),
-          body: JSON.stringify({ token: capability.token }),
+          body: JSON.stringify({
+            sessionId,
+            ...(readIsolationOriginChannelId ? { channelId: readIsolationOriginChannelId } : {}),
+            token: capability.token,
+            policyCapability,
+            ...(lastInitConfig?.larkAppId ? { larkAppId: lastInitConfig.larkAppId } : {}),
+            ...(lastInitConfig?.daemonBootId ? { bootInstanceId: lastInitConfig.daemonBootId } : {}),
+            ...(capability.turnId ? { turnId: capability.turnId } : {}),
+            ...(capability.dispatchAttempt !== undefined
+              ? { dispatchAttempt: capability.dispatchAttempt }
+              : {}),
+            ...(daemonIpcPort !== undefined ? { ipcPort: daemonIpcPort } : {}),
+          }),
         }]
       : []),
     ...(readIsolationOriginChannelId
@@ -2877,6 +2895,9 @@ function publishSandboxRelayCapability(opts: { failClosed?: boolean } = {}): boo
             sessionId,
             channelId: readIsolationOriginChannelId,
             capability: capability.token,
+            policyCapability,
+            ...(lastInitConfig?.larkAppId ? { larkAppId: lastInitConfig.larkAppId } : {}),
+            ...(lastInitConfig?.daemonBootId ? { bootInstanceId: lastInitConfig.daemonBootId } : {}),
             ...(capability.turnId ? { turnId: capability.turnId } : {}),
             ...(capability.dispatchAttempt !== undefined
               ? { dispatchAttempt: capability.dispatchAttempt }
@@ -2913,11 +2934,13 @@ function publishSandboxRelayCapability(opts: { failClosed?: boolean } = {}): boo
   }
 
   sandboxRelayCapability = capability;
+  sandboxPolicyCapability = policyCapability;
   if (sessionId) {
     send({
       type: 'managed_turn_origin',
       sessionId,
       capability: capability.token,
+      policyCapability,
       ...(readIsolationOriginChannelId
         ? { originChannelId: readIsolationOriginChannelId }
         : {}),
@@ -2950,17 +2973,21 @@ function completeManagedTurnOriginRevocation(
   revoked: typeof sandboxRelayCapability,
   turnId: string | undefined,
   dispatchAttempt: number | undefined,
+  opts: { revokePolicy?: boolean } = {},
 ): void {
   // Clear local authority before queuing daemon IPC. A forked/delayed process
   // can otherwise win the small window between terminal publication and
   // revocation by submitting through the still-live host relay.
   sandboxRelayCapability = null;
+  const revokedPolicyCapability = opts.revokePolicy ? sandboxPolicyCapability : null;
+  if (opts.revokePolicy) sandboxPolicyCapability = null;
   currentVcMeetingImTurnOrigin = undefined;
   if (sessionId) {
     send({
       type: 'managed_turn_origin_revoked',
       sessionId,
       ...(revoked ? { capability: revoked.token } : {}),
+      ...(revokedPolicyCapability ? { policyCapability: revokedPolicyCapability } : {}),
       ...(readIsolationOriginChannelId
         ? { originChannelId: readIsolationOriginChannelId }
         : {}),
@@ -2987,6 +3014,7 @@ function revokeManagedTurnOriginForRestart(): void {
     revoked,
     currentBotmuxTurnId,
     currentBotmuxDispatchAttempt,
+    { revokePolicy: false },
   );
 }
 
@@ -3000,7 +3028,7 @@ function revokeManagedTurnOriginForTerminal(
   if (!revoked
     || revoked.turnId !== turnId
     || revoked.dispatchAttempt !== dispatchAttempt) return;
-  completeManagedTurnOriginRevocation(revoked, turnId, dispatchAttempt);
+  completeManagedTurnOriginRevocation(revoked, turnId, dispatchAttempt, { revokePolicy: false });
 }
 function authorizeManagedSend(
   claim: { capability?: string },
@@ -13186,6 +13214,10 @@ async function spawnCli(
     if (!path) return '';
     try { return realpathSync(path); } catch { return path; }
   };
+  const botmuxInstallRoot = canonicalPolicyPath(dirname(dirname(fileURLToPath(import.meta.url))));
+  const nativeHookProtocolToken = cfg.cliId === 'traex' && !remoteWsUrl
+    ? 'native-subagent-runtime-hook.v1'
+    : '';
   const darwinIsolationPolicyDigest = process.platform === 'darwin'
     ? isolationPanePolicyDigest({
         readIsolation: willReadIsolate,
@@ -13211,15 +13243,18 @@ async function spawnCli(
     : undefined;
   const managedOriginChannelRequired = willReadIsolate
     || credentialOnlySeatbelt
-    || credentialOnlyBwrap;
+    || credentialOnlyBwrap
+    || sandboxRequested;
   const managedOriginChannelPolicyDigest = (willReadIsolate || willWriteSandbox)
     ? darwinIsolationPolicyDigest
     : managedOriginChannelRequired
       ? createHash('sha256').update(JSON.stringify({
-          domain: 'botmux.credential-origin-channel.v1',
+          domain: 'botmux.credential-origin-channel.v2',
           platform: process.platform,
           configuredBotmuxHome: canonicalPolicyPath(configuredBotmuxHome),
           defaultBotmuxHome: canonicalPolicyPath(defaultBotmuxHome),
+          botmuxInstallRoot,
+          nativeHookProtocolToken,
         })).digest('hex')
       : undefined;
 
@@ -13622,6 +13657,21 @@ async function spawnCli(
     : null;
   if (readIsolationOriginChannelId) {
     persistentPaneOriginChannelId = readIsolationOriginChannelId;
+    ensureManagedOriginCapabilityLeafSafe(managedOriginCapabilityPath(
+      isolationRuntimeDataDir,
+      cfg.sessionId,
+      readIsolationOriginChannelId,
+    ));
+    ensureManagedOriginAttestationDirectory(
+      isolationRuntimeDataDir,
+      cfg.sessionId,
+      readIsolationOriginChannelId,
+    );
+    sweepManagedOriginAttestationProofs(
+      isolationRuntimeDataDir,
+      cfg.sessionId,
+      readIsolationOriginChannelId,
+    );
   }
   let willReattachPersistent = selectedBackend.isReattach === true;
   if (cliAdapter.mcpGateway && mcpRuntimeManifest?.entries.length && persistentSessionName && effectiveBackendType !== 'pty') {
@@ -14136,6 +14186,11 @@ async function spawnCli(
     // RPC viewer branch actually triggers and never carries the bypass flags.
     remoteWsUrl,
     remoteThreadId,
+    // The remote TUI is only a viewer; its app-server received the same hook in
+    // engageCodexRpc. Plain Trae TUI processes own the model and get it here.
+    nativeSubagentRuntimeHookCommand: cfg.cliId === 'traex' && !remoteWsUrl
+      ? nativeSubagentRuntimeHookCommand()
+      : undefined,
   });
   // Pi's deferred long-first-prompt command is implemented by a session-scoped
   // extension. Keep its launch args across owned process restarts while the
@@ -14598,7 +14653,6 @@ async function spawnCli(
     // This module compiles to <checkout>/dist/worker.js, so `../../` from here is
     // the checkout root. Exposed readOnly so `botmux` + claude hooks can exec
     // `node <checkout>/dist/cli.js`.
-    const botmuxInstallRoot = canonical(dirname(dirname(fileURLToPath(import.meta.url))));
     // A development worktree may share dependencies through a node_modules
     // symlink. Seatbelt resolves that link before matching policy rules, so the
     // checkout grant alone does not cover the canonical dependency tree.
@@ -14679,16 +14733,6 @@ async function spawnCli(
       if (dataRootProbe !== 'host_accessible') {
         throw new Error('[read-isolation] locator-selected data-root probe is unavailable or unsafe');
       }
-      ensureManagedOriginAttestationDirectory(
-        dataDir,
-        cfg.sessionId,
-        readIsolationOriginChannelId!,
-      );
-      sweepManagedOriginAttestationProofs(
-        dataDir,
-        cfg.sessionId,
-        readIsolationOriginChannelId!,
-      );
     }
     readIsolationOriginCapabilityFile = process.platform === 'darwin'
       ? managedOriginCapabilityPath(
@@ -14736,6 +14780,18 @@ async function spawnCli(
           }
         } catch { /* absent authority root */ }
       }
+    }
+    if (process.platform === 'linux' && readIsolationOriginChannelId) {
+      mandatoryReadOnlyPaths.push(managedOriginCapabilityDirectory(
+        isolationRuntimeDataDir,
+        cfg.sessionId,
+        readIsolationOriginChannelId,
+      ));
+      mandatoryReadOnlyPaths.push(managedOriginAttestationDirectory(
+        isolationRuntimeDataDir,
+        cfg.sessionId,
+        readIsolationOriginChannelId,
+      ));
     }
     if (mcpRuntimeManifest) {
       mandatoryDenyPaths.push(...sessionMcpRuntimeHostOnlyPaths(
@@ -15247,10 +15303,15 @@ async function spawnCli(
       cfg.sessionId,
       readIsolationOriginChannelId!,
     );
+    const attestationDirectory = managedOriginAttestationDirectory(
+      isolationRuntimeDataDir,
+      cfg.sessionId,
+      readIsolationOriginChannelId!,
+    );
     const profilePath = join(profileDir, `${cfg.sessionId}.sb`);
     replaceManagedOriginCapabilityFile(profilePath, buildSeatbeltProfile(
       [...rules.denyPaths.map(canonical), canonical(profileDir)],
-      [canonical(originDirectory)],
+      [canonical(originDirectory), canonical(attestationDirectory)],
       [],
       [canonical(profileDir)],
       rules.denyRegexes,
@@ -15347,14 +15408,24 @@ async function spawnCli(
     const credentialSandbox = prepareCredentialOnlySandbox({
       hideDirectories: [...hideDirectories],
       hideFiles: [...hideFiles],
-      privateReadonlyDirectories: [{
-        parent: realpathSync(panePolicyDir),
-        directory: realpathSync(managedOriginCapabilityDirectory(
-          isolationRuntimeDataDir,
-          cfg.sessionId,
-          readIsolationOriginChannelId!,
-        )),
-      }],
+      privateReadonlyDirectories: [
+        {
+          parent: realpathSync(panePolicyDir),
+          directory: realpathSync(managedOriginCapabilityDirectory(
+            isolationRuntimeDataDir,
+            cfg.sessionId,
+            readIsolationOriginChannelId!,
+          )),
+        },
+        {
+          parent: realpathSync(panePolicyDir),
+          directory: realpathSync(managedOriginAttestationDirectory(
+            isolationRuntimeDataDir,
+            cfg.sessionId,
+            readIsolationOriginChannelId!,
+          )),
+        },
+      ],
       workingDir: spawnCwd,
       cliBin: credentialCliBin,
       cliArgs: spawnArgs,
@@ -16088,13 +16159,15 @@ async function spawnCli(
     stopSessionMcpGatewayHost();
     const exitedTurnId = currentBotmuxTurnId;
     const exitedDispatchAttempt = currentBotmuxDispatchAttempt;
-    // Fail closed as soon as this CLI generation ends. The Node worker may
-    // stay alive for auto-restart/crash diagnostics, but an old sandbox relay
-    // token or explicit IM origin must not remain usable in that interval.
+    // Fail closed for the ended backend generation's live-send authority. The
+    // Node worker may stay alive for daemon-driven crash recovery, so its
+    // generation-scoped policy authority remains valid until killCli() performs
+    // an actual worker teardown.
     completeManagedTurnOriginRevocation(
       sandboxRelayCapability,
       exitedTurnId,
       exitedDispatchAttempt,
+      { revokePolicy: false },
     );
     log(`${cliName()} exited (code: ${code}, signal: ${signal})`);
     if (lastInitConfig?.cliId === 'codex-app' && codexAppControlFatal) {
@@ -16377,6 +16450,9 @@ function restoreMojoLivePatchAfterRespawn(): void {
 
 function killCli(opts: {
   preservePending?: boolean;
+  /** An intentional in-worker CLI restart replaces only the live backend. The
+   * surviving Node worker keeps its generation-scoped policy authority. */
+  preservePolicyCapability?: boolean;
   /** The replacement worker reuses this logical session's sandbox tree. Stop
    * this worker's watcher but leave the tree/mountpoints for that replacement. */
   preserveSandbox?: boolean;
@@ -16434,6 +16510,7 @@ function killCli(opts: {
     sandboxRelayCapability,
     currentBotmuxTurnId,
     currentBotmuxDispatchAttempt,
+    { revokePolicy: !opts.preservePolicyCapability },
   );
   // Stop the sandbox outbox watcher, then reclaim the deny-mask mountpoints +
   // remove the per-session sandbox tree. In the fs-policy model the CLI writes
@@ -16579,7 +16656,10 @@ async function restartCliProcess(
         ));
         return;
       }
-      killCli({ preservePending: opts.preservePending });
+      killCli({
+        preservePending: opts.preservePending,
+        preservePolicyCapability: true,
+      });
       awaitingFirstPrompt = true;
       setTimeout(async () => {
         let spawnedWorkingDir: string | undefined;
@@ -20115,6 +20195,7 @@ function teardownSandboxBestEffort(): void {
   sandboxCleanup = null;
   unlinkManagedOriginCapabilityFiles();
   sandboxRelayCapability = null;
+  sandboxPolicyCapability = null;
   if (seatbeltProfilePath) { try { unlinkSync(seatbeltProfilePath); } catch { /* */ } seatbeltProfilePath = null; }
 }
 // Under pm2 the worker's stdout/stderr are pipes; a broken pipe (e.g. log
