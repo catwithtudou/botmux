@@ -4053,11 +4053,18 @@ function writeDaemonDescriptor(d: DaemonDescriptor): void {
   atomicWriteFileSync(fp, JSON.stringify(d), { mode: 0o600 });
 }
 
-function removeDaemonDescriptor(larkAppId: string): void {
+function removeDaemonDescriptor(larkAppId: string, ownBootInstanceId: string): void {
   const fp = join(DAEMON_REGISTRY_DIR, `${larkAppId}.json`);
-  if (existsSync(fp)) {
-    try { unlinkSync(fp); } catch { /* ignore */ }
-  }
+  if (!existsSync(fp)) return;
+  try {
+    // Restart overlap: the successor may already have republished this file
+    // while we were still tearing down. Its descriptor is not ours to remove —
+    // unlinking it would hide a live daemon from IPC discovery for up to one
+    // heartbeat while its occupancy lease says the store is held.
+    const current = JSON.parse(readFileSync(fp, 'utf-8')) as { bootInstanceId?: unknown };
+    if (typeof current.bootInstanceId === 'string' && current.bootInstanceId !== ownBootInstanceId) return;
+  } catch { /* unreadable: treat as ours */ }
+  try { unlinkSync(fp); } catch { /* ignore */ }
 }
 
 /**
@@ -21764,7 +21771,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // hook 适配 adopt"不成立。这里幂等、best-effort，不阻塞启动。
   try { ensureCliEnv(cfg.cliId, cfg.cliPathOverride); }
   catch (err) { logger.warn(`[hook] startup ensureCliEnv failed for ${cfg.cliId}: ${err instanceof Error ? err.message : String(err)}`); }
-  sessionStore.init(cfg.larkAppId);
+  sessionStore.init(cfg.larkAppId, {
+    occupancy: { bootId: getDaemonBootId(), pid: process.pid },
+  });
   chatFirstSeenStore.init(cfg.larkAppId);
   initSessionGroups(cfg.larkAppId);
   const ambiguousOnBoot = reconcileVcMeetingDeliveriesOnBoot(
@@ -22316,19 +22325,47 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // /healthz AND the public control routes (trigger/result/insight) return 503,
   // so riff never triggers into a racing durable restore (codex P1).
 
-  // Publish daemon ownership immediately after IPC binds, then perform the
-  // first session-store load under the store's cross-process write exclusion
-  // (the shared file lock on JSON, a BEGIN IMMEDIATE read on SQLite — a plain
-  // SELECT would NOT wait for an in-flight offline writer). An offline CLI
-  // either observes this descriptor and delegates, or it already holds the
-  // write exclusion; in the latter case this load waits and sees its atomic
-  // mutation. Never load a stale cache in an unadvertised startup window.
+  // Publish the IPC descriptor after bind, then first-load the session store
+  // under BEGIN IMMEDIATE (a plain SELECT would not wait for an in-flight
+  // offline writer). Occupancy is claimed in that same load transaction —
+  // the descriptor is discovery only. An offline writer either sees the
+  // lease and yields, or already holds the write exclusion; in the latter
+  // case this load waits and sees its atomic mutation.
+  //
+  // The first load may already have happened above (the idempotency reconcile
+  // reads the store), so the claim inside it can predate this point by the
+  // whole reconcile; claim again now rather than waiting for the first tick.
+  // The claim doubles as renew, so a lease lost to an overlapping boot is
+  // re-acquired on the next tick once that boot releases or lapses.
   desc.lastHeartbeat = Date.now();
   writeDaemonDescriptor(desc);
   sessionStore.listSessions();
+  let occupancyState: sessionStore.OccupancyClaimResult | 'error' | undefined;
+  const claimOccupancy = (): void => {
+    let next: typeof occupancyState;
+    try {
+      next = sessionStore.claimOccupancyLease({ bootId: getDaemonBootId(), pid: process.pid });
+    } catch (err) {
+      next = 'error';
+      if (occupancyState !== 'error') {
+        logger.warn(`[occupancy] lease claim failed (retrying each heartbeat): ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    if (next !== occupancyState) {
+      if (next === 'displaced') {
+        const holder = (() => { try { return sessionStore.readOccupancyLease(cfg.larkAppId); } catch { return undefined; } })();
+        logger.warn(`[occupancy] session store is held by another live daemon boot${holder ? ` (pid ${holder.ownerPid})` : ''}; this process runs without the lease and retries each heartbeat`);
+      } else if (next === 'held' && occupancyState !== undefined) {
+        logger.info('[occupancy] session store lease acquired');
+      }
+    }
+    occupancyState = next;
+  };
+  claimOccupancy();
   const descriptorHeartbeat = setInterval(() => {
     desc.lastHeartbeat = Date.now();
     try { writeDaemonDescriptor(desc); } catch { /* best effort */ }
+    claimOccupancy();
   }, 30_000);
   if (typeof descriptorHeartbeat.unref === 'function') descriptorHeartbeat.unref();
 
@@ -23237,7 +23274,12 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     clearInterval(idleWorkerSweepTimer);
     clearInterval(sessionOwnerReminderTimer);
     if (memoryDiagnostics) clearInterval(memoryDiagnostics);
-    removeDaemonDescriptor(cfg.larkAppId);
+    // Keep the occupancy lease for the whole teardown: workers still settle
+    // rows into this cache and persist them below. Extend it once here (the
+    // heartbeat is stopped) and release it only at the very end, so an offline
+    // writer cannot slip a commit under a write-back that is still coming.
+    claimOccupancy();
+    removeDaemonDescriptor(cfg.larkAppId, desc.bootInstanceId);
     ipcHandle.close().catch(() => { /* swallow */ });
     if (terminalProxy) terminalProxy.close().catch(() => { /* swallow */ });
 
@@ -23409,6 +23451,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     // SIGTERM we want anything learned since the last flush to land.
     flushIdentityCacheSync();
 
+    try { sessionStore.releaseOccupancyLease({ bootId: getDaemonBootId() }); } catch { /* exit handler retries */ }
     removePidFile();
     process.exit(gracefulProcessExitCode());
       },
@@ -23450,7 +23493,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     clearInterval(sessionOwnerReminderTimer);
     clearInterval(docCommentPollTimer);
     if (memoryDiagnostics) clearInterval(memoryDiagnostics);
-    removeDaemonDescriptor(cfg.larkAppId);
+    try { sessionStore.releaseOccupancyLease({ bootId: getDaemonBootId() }); } catch { /* best effort */ }
+    removeDaemonDescriptor(cfg.larkAppId, desc.bootInstanceId);
     // Plain-exit path (uncaught fatal, manual process.exit) bypasses the
     // graceful shutdown above. flushIdentityCacheSync is synchronous and
     // idempotent — safe to call here as a belt-and-suspenders save.
