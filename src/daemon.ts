@@ -494,6 +494,7 @@ import {
   publishSessionMessagePreviewPatch,
   publishClosedSessionPatch,
   clearAgentAttention,
+  stampHumanActivity,
 } from './core/session-activity.js';
 import { emitSessionLifecycleHook } from './services/session-lifecycle-hooks.js';
 import { botAutoWorktreeEnabled } from './services/default-worktree.js';
@@ -17435,6 +17436,7 @@ async function startInitialPassthroughSession(args: {
   session.quoteTargetSenderOpenId = senderOpenId;
   session.quoteTargetSenderIsBot = resolvedSenderIsBot;
   session.lastMessageAt = new Date(now).toISOString();
+  if (!resolvedSenderIsBot) stampHumanActivity(session, now);
   session.scope = scope;
   fillNativeTopicId(session, scope, parsed.threadId);
   sessionStore.updateSession(session);
@@ -18364,6 +18366,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   session.ownerOpenId = ownerOpenIdForSession;
   session.ownerUnionId = ownerUnionIdForSession;
   session.creatorOpenId = senderOpenId;
+  if (!isBotSenderType && !isForeignBotSender) stampHumanActivity(session, now);
   session.lastCallerOpenId = senderOpenId;
   // First turn of a brand-new topic: seed quoteTarget* so the very first
   // `botmux send` can --mention-back / 引用 the triggering message (chat scope).
@@ -19825,7 +19828,7 @@ async function handleThreadReplyAdmitted(
   // where the caller is often not the session owner).
   const callerOpenId = parsed.senderId || data?.sender?.sender_id?.open_id;
   if (ds) {
-    markSessionActivity(ds);
+    markSessionActivity(ds, Date.now(), { human: parsed.senderType === 'user' && !isForeignBot });
     // quoteTargetId changes every inbound message (always a new message_id), so
     // — unlike lastCallerOpenId — persist unconditionally. Powers `botmux send`'s
     // default chat-scope quote chain + --mention-back.
@@ -20210,6 +20213,7 @@ async function handleThreadReplyAdmitted(
     session.quoteTargetSenderOpenId = senderOId;
     session.quoteTargetSenderIsBot = isForeignBot;
     session.lastMessageAt = new Date(now).toISOString();
+    if (parsed.senderType === 'user' && !isForeignBot) stampHumanActivity(session, now);
     session.scope = scope;
     fillNativeTopicId(session, scope, parsed.threadId);
     const groupChatName = await groupChatNamePromise;

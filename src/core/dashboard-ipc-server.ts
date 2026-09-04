@@ -3116,6 +3116,7 @@ export interface ScheduleRow {
   repeat?: { times: number | null; completed: number };
   deliver?: 'origin' | 'local' | 'new-topic';
   silent?: boolean;
+  followActive?: boolean;
   feishuChatLink: string;
 }
 
@@ -3143,6 +3144,7 @@ function composeScheduleRow(t: ScheduledTask): ScheduleRow {
     repeat: t.repeat,
     deliver: t.deliver ?? 'origin',
     silent: t.silent,
+    followActive: t.followActive === true ? true : undefined,
     feishuChatLink: feishuChatLink(t.chatId, getBotBrand(t.larkAppId)),
   };
 }
@@ -3200,6 +3202,15 @@ ipcRoute('POST', '/api/schedules', async (req, res) => {
       return jsonRes(res, 400, { ok: false, error: 'invalid_field', field: 'silent' });
     }
     silent = b.silent;
+  }
+  // followActive — if present, must be boolean; topic-only (scheduler.addTask
+  // rejects the rest with follow_active_requires_topic).
+  let followActive = false;
+  if (b.followActive !== undefined) {
+    if (typeof b.followActive !== 'boolean') {
+      return jsonRes(res, 400, { ok: false, error: 'invalid_field', field: 'followActive' });
+    }
+    followActive = b.followActive;
   }
   let executionPosition: ScheduleExecutionPosition = 'top-level';
   if (b.executionPosition !== undefined) {
@@ -3262,6 +3273,7 @@ ipcRoute('POST', '/api/schedules', async (req, res) => {
       ownerOpenId: getOwnerOpenId(cachedLarkAppId),
       deliver,
       silent,
+      followActive: followActive || undefined,
     });
     dashboardEventBus.publish({ type: 'schedule.created', body: { schedule: composeScheduleRow(task) } });
     jsonRes(res, 200, { ok: true, task: composeScheduleRow(task) });
